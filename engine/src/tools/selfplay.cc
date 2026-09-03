@@ -539,7 +539,13 @@ std::array<uint8_t, NB_INPUT_VALUES()> encode_planes(
 std::string current_date() {
     const std::time_t now = std::time(nullptr);
     std::tm localTime{};
+    // The thread-safe localtime is spelled differently on each platform, and
+    // the two take their arguments in opposite orders.
+#if defined(_WIN32)
+    localtime_s(&localTime, &now);
+#else
     localtime_r(&now, &localTime);
+#endif
     std::ostringstream date;
     date << std::put_time(&localTime, "%Y.%m.%d");
     return date.str();

@@ -21,6 +21,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <stdexcept>
 
@@ -122,8 +123,13 @@ bool Engine::loadNetwork(const std::string& onnxFile,
         state.options.SetInterOpNumThreads(1);
         state.options.SetExecutionMode(ORT_SEQUENTIAL);
 
+        // ORT spells its path type ORTCHAR_T, which is wchar_t on Windows and
+        // char everywhere else. std::filesystem::path::value_type follows the
+        // same split, so going through a path is the one spelling that
+        // compiles on every platform.
+        const std::filesystem::path onnxPath(onnxFile);
         state.session = std::make_unique<Ort::Session>(
-            ort_env(), onnxFile.c_str(), state.options);
+            ort_env(), onnxPath.c_str(), state.options);
 
         Ort::AllocatorWithDefaultOptions allocator;
 
