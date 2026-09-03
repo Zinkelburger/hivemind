@@ -22,8 +22,17 @@ ROOT = Path(__file__).resolve().parent.parent
 TARGET = ROOT / "third_party" / "onnxruntime"
 
 
-def asset_name(version: str) -> str:
-    system, machine = platform.system(), platform.machine().lower()
+def asset_name(version: str, system: str | None = None,
+               machine: str | None = None) -> str:
+    """Archive to download for a target.
+
+    Defaults to the host, but both halves can be overridden: a release build
+    cross-compiles the macOS x86_64 slice on an Apple Silicon runner, and needs
+    the runtime for the architecture it is producing rather than the one it is
+    running on.
+    """
+    system = system or platform.system()
+    machine = (machine or platform.machine()).lower()
     if system == "Linux":
         arch = "aarch64" if machine in ("aarch64", "arm64") else "x64"
         return f"onnxruntime-linux-{arch}-{version}.tgz"
@@ -40,13 +49,18 @@ def main() -> int:
     ap.add_argument("--version", default=DEFAULT_VERSION)
     ap.add_argument("--force", action="store_true",
                     help="re-download even if third_party/onnxruntime exists")
+    ap.add_argument("--system", choices=("Linux", "Darwin", "Windows"),
+                    help="target OS (default: this machine's)")
+    ap.add_argument("--machine",
+                    help="target architecture, e.g. x86_64 or arm64 "
+                         "(default: this machine's)")
     a = ap.parse_args()
 
     if TARGET.exists() and not a.force:
         print(f"{TARGET} already present; pass --force to replace it.")
         return 0
 
-    name = asset_name(a.version)
+    name = asset_name(a.version, a.system, a.machine)
     url = (
         "https://github.com/microsoft/onnxruntime/releases/download/"
         f"v{a.version}/{name}"

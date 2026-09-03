@@ -1,0 +1,220 @@
+# Builds the portable (ONNX Runtime) engine for every desktop and publishes the
+# bundles as release assets.
+#
+# Why this exists: the upstream release is a ~2 GB Linux/NVIDIA TensorRT bundle,
+# so anything that wants to *ship* Hivemind to ordinary desktops has to build it
+# itself. These jobs produce the small CPU build -- a ~2 MB engine plus the ~28 MB
+# runtime -- for Linux, Windows and both Macs.
+#
+# Two rules keep the output redistributable, and both are easy to lose:
+#
+#   * No `-march=native`. The default developer build tunes for the build
+#     machine and SIGILLs on an older CPU, so every job pins an explicit
+#     baseline. x86-64-v2 costs almost nothing here because ONNX Runtime
+#     dispatches its own kernels at runtime -- the flag only affects Hivemind's
+#     own search and board code.
+#   * The oldest practical glibc. Linux builds run in manylinux_2_28 (glibc
+#     2.28, the same floor ONNX Runtime itself is built against) with the C++
+#     runtime linked statically, which covers Debian 10, Ubuntu 20.04 and
+#     RHEL 8 onwards.
+
+name: Engine release
+
+on:
+  push:
+    tags: ['engine-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish the bundles under (e.g. engine-v1)'
+        required: true
+        default: 'engine-dev'
+
+permissions:
+  contents: write
+
+env:
+  ORT_VERSION: '1.29.0'
+  X86_BASELINE: 'x86-64-v2'
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: python3 -m pip install --quiet cmake ninja
+
+      - name: Fetch ONNX Runtime
+        run: python3 tools/fetch_onnxruntime.py --version "$ORT_VERSION"
+
+      - name: Configure
+        run: |
+          # manylinux keeps a modern GCC behind an SCL; C++23 needs it.
+          if [ -f /opt/rh/gcc-toolset-14/enable ]; then . /opt/rh/gcc-toolset-14/enable; fi
+          gcc --version | head -1
+          cmake -S engine -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHIVEMIND_BACKEND=onnxruntime \
+            -DHIVEMIND_NATIVE_ARCH=OFF \
+            -DHIVEMIND_ARCH="$X86_BASELINE" \
+            -DHIVEMIND_STATIC_CXX_RUNTIME=ON \
+            -DHIVEMIND_USE_CCACHE=OFF \
+            -DBUILD_TESTING=OFF
+
+      - name: Build
+        run: |
+          if [ -f /opt/rh/gcc-toolset-14/enable ]; then . /opt/rh/gcc-toolset-14/enable; fi
+          cmake --build build -j"$(nproc)"
+
+      - name: Report the version floor we are actually shipping
+        run: |
+          objdump -p build/hivemind.bin | grep -A40 'Version References' || true
+          echo "--- highest glibc symbol version required ---"
+          objdump -T build/hivemind.bin | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+
+      - name: Package
+        run: python3 tools/package_engine.py --build build --target linux-x64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hivemind-linux-x64
+          path: dist/hivemind-linux-x64.tar.gz*
+
+  windows-x64:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      # mingw-w64, not MSVC: the tree uses __builtin_ctzll / __builtin_bswap64
+      # and a pile of GNU flags, all of which MSVC rejects and mingw accepts
+      # unchanged. It is also how Stockfish itself is built for Windows.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+            unzip
+
+      - uses: actions/checkout@v4
+
+      - name: Fetch ONNX Runtime
+        run: python3 tools/fetch_onnxruntime.py --version "$ORT_VERSION"
+
+      - name: Configure
+        run: |
+          gcc --version | head -1
+          cmake -S engine -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHIVEMIND_BACKEND=onnxruntime \
+            -DHIVEMIND_NATIVE_ARCH=OFF \
+            -DHIVEMIND_ARCH="$X86_BASELINE" \
+            -DHIVEMIND_STATIC_CXX_RUNTIME=ON \
+            -DHIVEMIND_USE_CCACHE=OFF \
+            -DBUILD_TESTING=OFF
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Check nothing from MSYS leaked into the link
+        run: |
+          # A mingw build that still needs libstdc++-6.dll or libwinpthread-1.dll
+          # runs on the build machine and nowhere else.
+          objdump -p build/hivemind.bin.exe | grep 'DLL Name' | sort -u
+
+      - name: Package
+        run: python3 tools/package_engine.py --build build --target windows-x64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hivemind-windows-x64
+          path: dist/hivemind-windows-x64.zip*
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both slices are built on Apple Silicon: the x86_64 one cross-compiles
+          # through CMAKE_OSX_ARCHITECTURES, which avoids depending on an Intel
+          # runner image still existing.
+          - target: macos-arm64
+            arch: arm64
+            baseline: apple-m1
+          - target: macos-x86_64
+            arch: x86_64
+            baseline: x86-64-v2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch ONNX Runtime (${{ matrix.arch }})
+        run: |
+          python3 tools/fetch_onnxruntime.py --version "$ORT_VERSION" \
+            --system Darwin --machine ${{ matrix.arch }}
+
+      - name: Configure
+        run: |
+          cmake -S engine -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DHIVEMIND_BACKEND=onnxruntime \
+            -DHIVEMIND_NATIVE_ARCH=OFF \
+            -DHIVEMIND_ARCH=${{ matrix.baseline }} \
+            -DHIVEMIND_USE_CCACHE=OFF \
+            -DBUILD_TESTING=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Confirm the slice really is ${{ matrix.arch }}
+        run: |
+          lipo -info build/hivemind.bin
+          otool -l build/hivemind.bin | grep -A2 LC_RPATH || true
+
+      - name: Package
+        run: python3 tools/package_engine.py --build build --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hivemind-${{ matrix.target }}
+          path: dist/hivemind-${{ matrix.target }}.tar.gz*
+
+  release:
+    needs: [linux-x64, windows-x64, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - run: ls -lh artifacts
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          body: |
+            Portable CPU builds of the Hivemind bughouse engine, for embedding in
+            desktop applications. Each archive is flat: the engine and the ONNX
+            Runtime it links against, side by side, so no environment variables
+            are needed to launch it.
+
+            Built with an explicit `x86-64-v2` baseline (`apple-m1` on Apple
+            Silicon) rather than `-march=native`, and on Linux against glibc 2.28
+            with a static C++ runtime — so these run on Debian 10, Ubuntu 20.04
+            and RHEL 8 onwards, not just the machine that built them.
+
+            The network (`hivemind-network-fp32.onnx.gz`) is architecture
+            independent and is attached to this release separately.

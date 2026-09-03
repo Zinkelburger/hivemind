@@ -19,6 +19,14 @@ option(HIVEMIND_USE_UNITY_BUILD "Enable unity builds for project targets" ON)
 option(HIVEMIND_USE_CCACHE "Use ccache when available" ON)
 option(HIVEMIND_NATIVE_ARCH "Optimize for the build machine's CPU" ON)
 
+# `-march=native` is the right default for someone building the engine for the
+# machine they are sitting at, and exactly wrong for anything redistributable:
+# it bakes in whatever the build host happened to support, so the binary dies
+# with SIGILL on an older CPU. Redistributable builds set an explicit baseline
+# here instead, which wins over HIVEMIND_NATIVE_ARCH when both are given.
+set(HIVEMIND_ARCH "" CACHE STRING
+    "Explicit architecture baseline for redistributable builds (e.g. x86-64-v2); empty means follow HIVEMIND_NATIVE_ARCH")
+
 # Set C++ version and optimization level
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -32,19 +40,69 @@ if(HIVEMIND_USE_CCACHE)
 endif()
 
 # Fast local builds trade some runtime optimization for much shorter compile/link times.
-set(HIVEMIND_COMMON_FLAGS "-Wall -DNDEBUG -DNNUE_EMBEDDING_OFF")
-if(HIVEMIND_NATIVE_ARCH)
-    string(APPEND HIVEMIND_COMMON_FLAGS " -march=native")
-endif()
-if(HIVEMIND_FAST_BUILD)
-    string(APPEND HIVEMIND_COMMON_FLAGS " -O2")
-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
+if(MSVC)
+    # Kept building-but-untested: the tree uses __builtin_ctzll / __builtin_bswap64,
+    # which MSVC does not provide. Build Windows binaries with mingw-w64 or
+    # clang-cl, both of which take the GNU flags below.
+    set(HIVEMIND_COMMON_FLAGS "/W3 /DNDEBUG /DNNUE_EMBEDDING_OFF")
+    if(HIVEMIND_FAST_BUILD)
+        string(APPEND HIVEMIND_COMMON_FLAGS " /O2")
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
+    else()
+        string(APPEND HIVEMIND_COMMON_FLAGS " /O2 /GL")
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
 else()
-    string(APPEND HIVEMIND_COMMON_FLAGS " -Ofast -flto")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto")
-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set(HIVEMIND_COMMON_FLAGS "-Wall -DNDEBUG -DNNUE_EMBEDDING_OFF")
+
+    # Which architecture is actually being produced. Cross-compiling to x86_64
+    # on an Apple Silicon host leaves CMAKE_SYSTEM_PROCESSOR at arm64, so on
+    # Apple the answer has to come from CMAKE_OSX_ARCHITECTURES when it is set.
+    set(HIVEMIND_TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+    if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+        list(GET CMAKE_OSX_ARCHITECTURES 0 HIVEMIND_TARGET_ARCH)
+    endif()
+
+    # aarch64 compilers have no -march; they spell the same idea -mcpu.
+    if(HIVEMIND_TARGET_ARCH MATCHES "^(arm64|aarch64)$")
+        set(HIVEMIND_ARCH_FLAG "-mcpu")
+    else()
+        set(HIVEMIND_ARCH_FLAG "-march")
+    endif()
+
+    if(HIVEMIND_ARCH)
+        string(APPEND HIVEMIND_COMMON_FLAGS " ${HIVEMIND_ARCH_FLAG}=${HIVEMIND_ARCH}")
+    elseif(HIVEMIND_NATIVE_ARCH)
+        string(APPEND HIVEMIND_COMMON_FLAGS " ${HIVEMIND_ARCH_FLAG}=native")
+    endif()
+
+    if(HIVEMIND_FAST_BUILD)
+        string(APPEND HIVEMIND_COMMON_FLAGS " -O2")
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
+    else()
+        string(APPEND HIVEMIND_COMMON_FLAGS " -Ofast -flto")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto")
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
 endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${HIVEMIND_COMMON_FLAGS}")
+
+# A redistributable binary cannot rely on the target having the libstdc++ the
+# build machine linked against; folding both runtimes in leaves glibc as the
+# only version floor that matters. GNU-flavoured toolchains only -- Apple's
+# clang has no static libc++ to link.
+option(HIVEMIND_STATIC_CXX_RUNTIME "Link libstdc++/libgcc statically" OFF)
+if(HIVEMIND_STATIC_CXX_RUNTIME)
+    if(APPLE OR MSVC)
+        message(WARNING "HIVEMIND_STATIC_CXX_RUNTIME is a no-op on this toolchain")
+    else()
+        string(APPEND CMAKE_EXE_LINKER_FLAGS " -static-libstdc++ -static-libgcc")
+        if(WIN32)
+            # mingw-w64 threads pull in libwinpthread otherwise.
+            string(APPEND CMAKE_EXE_LINKER_FLAGS " -static")
+        endif()
+    endif()
+endif()
 
 # Add source files
 set(LIB_SOURCES
@@ -111,8 +169,22 @@ elseif(HIVEMIND_BACKEND STREQUAL "onnxruntime")
     message(STATUS "ONNX Runtime: ${ONNXRuntime_LIBRARY}")
 
     get_filename_component(ONNXRuntime_LIBDIR "${ONNXRuntime_LIBRARY}" DIRECTORY)
-    set(CMAKE_BUILD_RPATH "${ONNXRuntime_LIBDIR}")
-    set(CMAKE_INSTALL_RPATH "$ORIGIN;$ORIGIN/../lib;${ONNXRuntime_LIBDIR}")
+
+    # The shipped layout is the engine and the runtime side by side in one
+    # directory, so the loader has to be told to look next to the binary. Both
+    # RPATHs get it: CMAKE_BUILD_RPATH is what a binary copied straight out of
+    # the build tree carries, and that is exactly how the release bundles are
+    # assembled. Without it the only thing baked in is the build machine's
+    # absolute third_party path, and the caller is forced to set
+    # LD_LIBRARY_PATH / DYLD_LIBRARY_PATH to launch the engine at all.
+    if(APPLE)
+        set(HIVEMIND_ORIGIN "@loader_path")
+    else()
+        set(HIVEMIND_ORIGIN "$ORIGIN")
+    endif()
+    set(HIVEMIND_RPATH "${HIVEMIND_ORIGIN};${HIVEMIND_ORIGIN}/../lib;${ONNXRuntime_LIBDIR}")
+    set(CMAKE_BUILD_RPATH "${HIVEMIND_RPATH}")
+    set(CMAKE_INSTALL_RPATH "${HIVEMIND_RPATH}")
 else()
     message(FATAL_ERROR "Unknown HIVEMIND_BACKEND '${HIVEMIND_BACKEND}'")
 endif()
@@ -157,22 +229,36 @@ if(HIVEMIND_USE_UNITY_BUILD)
 endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE ${PROJECT_NAME}_lib)
 
-if(HIVEMIND_BACKEND STREQUAL "tensorrt")
-    file(WRITE "${CMAKE_BINARY_DIR}/hivemind"
-    "#!/bin/sh\n"
-    "set -e\n"
-    "SCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
-    "export LD_LIBRARY_PATH=\"${TensorRT_DIR}/lib:${CUDA_TOOLKIT_ROOT_DIR}/lib64:${CUDA_TOOLKIT_ROOT_DIR}/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}\"\n"
-    "exec \"$SCRIPT_DIR/hivemind.bin\" \"$@\"\n")
-else()
-    # RPATH already points at the runtime; the wrapper just keeps the same entry point.
-    file(WRITE "${CMAKE_BINARY_DIR}/hivemind"
-    "#!/bin/sh\n"
-    "set -e\n"
-    "SCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
-    "exec \"$SCRIPT_DIR/hivemind.bin\" \"$@\"\n")
+# Windows resolves DLLs from the executable's own directory and has no RPATH
+# equivalent, so the runtime is copied rather than pointed at.
+if(WIN32 AND HIVEMIND_BACKEND STREQUAL "onnxruntime")
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${ONNXRuntime_ROOT}/lib/onnxruntime.dll"
+                "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+        COMMENT "Copying onnxruntime.dll next to hivemind.exe")
 endif()
-execute_process(COMMAND /bin/chmod 755 "${CMAKE_BINARY_DIR}/hivemind")
+
+# The sh wrapper is a POSIX convenience; on Windows the .exe is the entry point.
+if(NOT WIN32)
+    if(HIVEMIND_BACKEND STREQUAL "tensorrt")
+        file(WRITE "${CMAKE_BINARY_DIR}/hivemind"
+        "#!/bin/sh\n"
+        "set -e\n"
+        "SCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
+        "export LD_LIBRARY_PATH=\"${TensorRT_DIR}/lib:${CUDA_TOOLKIT_ROOT_DIR}/lib64:${CUDA_TOOLKIT_ROOT_DIR}/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}\"\n"
+        "exec \"$SCRIPT_DIR/hivemind.bin\" \"$@\"\n")
+    else()
+        # RPATH already points at the runtime; the wrapper just keeps the same entry point.
+        file(WRITE "${CMAKE_BINARY_DIR}/hivemind"
+        "#!/bin/sh\n"
+        "set -e\n"
+        "SCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
+        "exec \"$SCRIPT_DIR/hivemind.bin\" \"$@\"\n")
+    endif()
+    # chmod, not /bin/chmod: macOS and Linux agree on the name, not the path.
+    execute_process(COMMAND chmod 755 "${CMAKE_BINARY_DIR}/hivemind")
+endif()
 
 include(CTest)
 enable_testing()
