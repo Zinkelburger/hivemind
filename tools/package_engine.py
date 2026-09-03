@@ -16,6 +16,7 @@ import hashlib
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import tarfile
 import zipfile
@@ -47,6 +48,65 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def macho_load_names(path: Path) -> list[str]:
+    """The dylibs a Mach-O file asks the loader for."""
+    out = subprocess.run(["otool", "-L", str(path)],
+                         capture_output=True, text=True, check=True).stdout
+    # First line is the file itself; the rest are "\t<path> (compat ...)".
+    return [line.split()[0] for line in out.splitlines()[1:] if line.startswith("\t")]
+
+
+def normalise_macos_names(engine: Path, runtime: Path) -> None:
+    """Make the engine ask for the runtime by the name we actually ship it as.
+
+    ONNX Runtime's install name carries its version -- `@rpath/libonnxruntime.1.dylib`
+    on arm64, `@rpath/libonnxruntime.1.23.0.dylib` on the Intel build pinned to
+    1.23 -- so a bundle that renames the file to a stable `libonnxruntime.dylib`
+    (which is what the consuming app looks for, and what keeps it from caring
+    which ORT version a given slice was built against) leaves the executable
+    asking for a file that is not there. Rewriting both halves is the only way
+    to have one stable name on both slices.
+
+    install_name_tool invalidates the code signature, and arm64 macOS refuses
+    to run an unsigned binary at all, so both get an ad-hoc signature after.
+    """
+    stable = "@rpath/libonnxruntime.dylib"
+
+    subprocess.run(["install_name_tool", "-id", stable, str(runtime)], check=True)
+
+    for name in macho_load_names(engine):
+        if "libonnxruntime" in name and name != stable:
+            print(f"  install_name  {name} -> {stable}")
+            subprocess.run(
+                ["install_name_tool", "-change", name, stable, str(engine)],
+                check=True,
+            )
+
+    for path in (engine, runtime):
+        subprocess.run(["codesign", "--force", "--sign", "-", str(path)], check=True)
+
+
+def verify_macos_bundle(engine: Path, stage: Path) -> None:
+    """Every @rpath dependency must be a file actually sitting in the bundle.
+
+    The bundle leads with an @loader_path RPATH, so an @rpath name resolves to
+    a sibling file -- and a name that has no sibling is a bundle that dies on
+    the user's machine with "Library not loaded" while passing every check that
+    only looked at the build tree.
+    """
+    for name in macho_load_names(engine):
+        if not name.startswith("@rpath/"):
+            continue
+        sibling = stage / name[len("@rpath/"):]
+        if not sibling.exists():
+            raise SystemExit(
+                f"ERROR: the engine asks for {name}, but the bundle has no "
+                f"{sibling.name}. Contents: "
+                f"{sorted(p.name for p in stage.iterdir())}"
+            )
+        print(f"  resolves      {name} -> {sibling.name}")
 
 
 def default_target() -> str:
@@ -99,6 +159,11 @@ def main() -> int:
     (stage / engine_name).chmod(0o755)
     shutil.copy2(runtime, stage / RUNTIME_INSTALL_NAME[target])
     shutil.copy2(ROOT / "LICENSE", stage / "LICENSE")
+
+    if target.startswith("macos"):
+        normalise_macos_names(stage / engine_name,
+                              stage / RUNTIME_INSTALL_NAME[target])
+        verify_macos_bundle(stage / engine_name, stage)
 
     for name, path in [("engine", stage / engine_name),
                        ("runtime", stage / RUNTIME_INSTALL_NAME[target])]:
