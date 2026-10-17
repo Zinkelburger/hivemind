@@ -32,6 +32,12 @@ struct SearchOptions {
     bool verbose = false;        // Output UCI info strings (info, bestmove)
     int multiPV = 1;             // Number of principal variations to output
     bool isPonder = false;       // Ponder mode: think continuously until ponderhit or stop
+    // `go infinite`: no node or time limit; the search ends on stop (or a
+    // solved root) and only then prints bestmove.
+    bool infinite = false;
+    // While searching, print the full MultiPV block this often (0 = only the
+    // final block before bestmove).
+    int reportIntervalMs = 0;
     bool enablePonder = true;    // Output ponder move with bestmove
     // Permanent-brain search: prints nothing, skips the root scans, runs until
     // stopped or until its own node/time cap, and retains its entire root
@@ -174,6 +180,15 @@ private:
         float childQ,
         float centipawnScale = 180.0f,
         float tangentScale = 1.56f);
+    // The `info depth ... [multipv N] ... pv ...` block for the current root:
+    // up to MultiPV lines, rank 1 the solver-aware choice bestmove follows,
+    // the rest by visits. Printed periodically while searching and once more
+    // before bestmove, in the same format.
+    // A periodic block (`visitedOnly`) leaves out children no visit has
+    // reached yet, whose q is still the unvisited -1.
+    void print_multipv_info(Board& board, const SearchInfo& searchInfo,
+                            const SearchOptions& options,
+                            bool visitedOnly = false);
 
 public:
     /**

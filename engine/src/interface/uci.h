@@ -29,6 +29,10 @@ private:
     int batchSize = SearchParams::BATCH_SIZE;
     std::atomic<bool> ongoingSearch{false};
     int multiPV = 1;  // Number of principal variations to display
+    // How often a search prints its MultiPV block while it runs (0 = only
+    // before bestmove). Its presence in `uci` is how a GUI knows the engine
+    // reports as it searches and accepts `go infinite`.
+    int reportIntervalMs = 250;
     bool ponderEnabled = true;  // Whether to output ponder move and accept ponder search
     SearchParams::RuntimeConfig searchConfig;
 

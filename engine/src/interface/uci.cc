@@ -152,11 +152,14 @@ void UCI::go(std::istringstream& is) {
     int moveTime = 0;
     size_t nodes = 0;
     bool isPonder = false;
+    bool infinite = false;
     
     // Parse go parameters
     while (is >> token) {
         if (token == "ponder") {
             isPonder = true;
+        } else if (token == "infinite") {
+            infinite = true;
         } else if (token == "movetime") {
             is >> moveTime;
         } else if (token == "nodes") {
@@ -183,7 +186,15 @@ void UCI::go(std::istringstream& is) {
 
     // Build search options based on what was specified
     SearchOptions opts;
-    if (nodes > 0) {
+    if (infinite) {
+        // Node-limited in form, with a limit no search reaches: the search
+        // ends on stop (or a solved root). The root mate scan keeps its
+        // ordinary ceiling.
+        opts = SearchOptions::uci(0, multiPV, isPonder);
+        opts.moveTimeMs = 0;
+        opts.targetNodes = static_cast<size_t>(1) << 40;
+        opts.infinite = true;
+    } else if (nodes > 0) {
         opts = SearchOptions::uci(static_cast<int>(nodes), multiPV, isPonder);
         opts.moveTimeMs = 0;  // Node-based search
         opts.targetNodes = nodes;
@@ -195,13 +206,14 @@ void UCI::go(std::istringstream& is) {
     }
     opts.enablePonder = ponderEnabled;
     opts.search = searchConfig;
+    opts.reportIntervalMs = reportIntervalMs;
     
     // Launch the search thread
     mainSearchThread = new std::thread([this, enginePtrs, opts]() {
         try {
             const JointActionCandidate played = agent->run_search(
                 board, enginePtrs, teamSide, teamHasTimeAdvantage, opts);
-            if (!opts.isPonder) {
+            if (!opts.isPonder && !opts.infinite) {
                 // Nothing else runs between moves. Keep thinking from the
                 // position our own move creates, so whichever reply the four
                 // asynchronous players produce lands on a subtree that already
@@ -283,6 +295,10 @@ void UCI::setoption(std::istringstream& is) {
             multiPV = mpv;
             std::cout << "info string MultiPV set to " << multiPV << std::endl;
         }
+    } else if (name == "ReportIntervalMs") {
+        reportIntervalMs = std::clamp(std::stoi(value), 0, 60000);
+        std::cout << "info string ReportIntervalMs set to " << reportIntervalMs
+                  << std::endl;
     } else if (name == "Ponder") {
         if (value == "true" || value == "false") {
             ponderEnabled = (value == "true");
@@ -385,6 +401,8 @@ void UCI::send_uci_response() {
          << " min 1 max 1024" << endl;
     cout << "option name MultiPV type spin default 1 min 1 max 500" << endl;
     cout << "option name Ponder type check default true" << endl;
+    cout << "option name ReportIntervalMs type spin default " << reportIntervalMs
+         << " min 0 max 60000" << endl;
     cout << "option name DrawContemptPermille type spin default 0 min 0 max 1000" << endl;
     cout << "option name MovesLeftDiscountPermille type spin default "
          << static_cast<int>(SearchParams::MOVES_LEFT_DISCOUNT * 1000.0f)

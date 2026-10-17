@@ -171,6 +171,25 @@ legal joint actions — set it to match the real clocks before searching.
 > setting (`sit` = `TimeAdvantage true`). It is still accepted but no longer
 > advertised.
 
+### Reports While Searching
+
+A search prints its whole MultiPV block (`info depth … [multipv N] … pv …`,
+the same lines as the final block) every `ReportIntervalMs` and whenever it
+reaches a new depth, for `go nodes`, `go movetime` and `go infinite` alike.
+Periodic blocks leave out root moves no visit has reached yet. The final
+block before `bestmove` is unchanged.
+
+```bash
+# Report every 250 ms (the default); 0 prints only the final block
+setoption name ReportIntervalMs value 250
+
+# Search until `stop` (or until the root is solved), then print bestmove
+go infinite
+```
+
+A GUI can tell a build that reports while it searches by the
+`option name ReportIntervalMs` line in its `uci` reply.
+
 ### Paired Model Tournament
 
 ```bash
